@@ -31,9 +31,17 @@ export async function results(route, refresh) {
     el('select',{id:'run-picker',onChange:event=>{location.hash=`#results/${event.target.value}`;}},
       (runs.some(item=>item.id===job.id) ? runs : [job,...runs]).map(item=>el('option',{value:item.id,selected:item.id===job.id},item.name))));
   const result = job.result;
+  const correctionBanner = result?.correction && el('div', {class:'decision', 'data-testid':'correction-banner'},
+    p(result.correction.summary), p(`受影响来信：${result.correction.affected.join('、') || '无（撤回后归口与原始一致）'}`, 'subtle'));
+  const versionTag = job.is_recalc
+    ? pill(job.is_current ? `当前生效 · 第 ${job.revision_no} 版更正` : `历史版本 · 第 ${job.revision_no} 版`,
+      job.is_current ? 'accepted' : 'returned')
+    : pill(job.current_revision_no ? `当前生效含第 ${job.current_revision_no} 版更正` : '原始交付版',
+      job.current_revision_no ? 'accepted' : 'pending');
   const analysis = result ? el('section',{class:'analysis','data-testid':'analysis-complete'},
     el('div',{class:'result-head'},p(job.name,'eyeline'),h(2,result.headline),p(result.note,'intro-copy'),
-      el('div',{class:'actions'},pill(STATUS[job.status],job.status),download,message)),
+      el('div',{class:'actions'},pill(STATUS[job.status],job.status),versionTag,download,message)),
+    correctionBanner,
     metrics(result.metrics),
     result.charts.map(plot),
     (result.sections || []).map(item=>panel(item.title,p(item.text))),
@@ -45,5 +53,7 @@ export async function results(route, refresh) {
       source && link(source.name,`#inputs/${source.id}`),p(date(job.finished_at),'subtle'),
       el('dl',{class:'dictionary'},inputs)),
     result && panel(spec.decision, pill(REVIEW[job.review],job.review),
-      link('打开复核记录',`#review/${job.id}`,{class:'quiet'})))));
+      link('打开复核记录',`#review/${job.id}`,{class:'quiet'}),
+      !job.is_recalc && job.review === 'accepted'
+        && link('归口更正与版本链', `#corrections/${job.parent_run_id || job.id}`, {class:'quiet'})))));
 }

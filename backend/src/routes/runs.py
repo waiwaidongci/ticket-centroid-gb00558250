@@ -39,32 +39,63 @@ def create(body: RunRequest, db: Session = Depends(connection),
     item = Run(name=body.name, dataset_id=body.dataset_id, params=normalize_params(body.params), author=actor.username)
     db.add(item)
     db.flush()
+    # 原始运行的当前版本指针初始指向自身，更正重算成功后由 worker 原子切换。
+    item.current_run_id = item.id
     record(db, actor.username, 'analysis.queued', item.id, dataset_id=item.dataset_id)
     db.commit()
     wake()
     return views.run(item, detail=True)
 
 
+def resolve_current(db, run_id):
+    """把任意运行 ID 解析为其运行链当前生效版本，历史版本仍可用自身 ID 直查。"""
+    item = db.get(Run, run_id)
+    if not item:
+        return None
+    if item.parent_run_id is None:
+        return db.get(Run, item.current_run_id or item.id)
+    root = db.get(Run, item.parent_run_id)
+    return db.get(Run, root.current_run_id or root.id) if root else item
+
+
 @router.get('/{run_id}')
 def detail(run_id: int, db: Session = Depends(connection), actor: User = Depends(current)):
-    return views.run(require_job(db, run_id), detail=True)
+    item = require_job(db, run_id)
+    data = views.run(item, detail=True)
+    if item.parent_run_id is not None:
+        root = db.get(Run, item.parent_run_id)
+        data['root_run_id'] = root.id
+        data['is_current'] = (root.current_run_id == item.id) if root else False
+    else:
+        current = db.get(Run, item.current_run_id or item.id)
+        data['is_current'] = True
+        data['current_run_id'] = current.id
+        data['current_revision_no'] = current.revision_no
+    return data
 
 
 @router.get('/{run_id}/export')
 def export(run_id: int, db: Session = Depends(connection), actor: User = Depends(current)):
     item = require_job(db, run_id)
-    if not item.export_file:
+    target = item
+    if item.parent_run_id is None and item.current_run_id and item.current_run_id != item.id:
+        target = db.get(Run, item.current_run_id) or item
+    if not target.export_file:
         raise HTTPException(409, '此记录尚无可下载结果')
-    path = ARTIFACTS / item.export_file
+    path = ARTIFACTS / target.export_file
     if not path.is_file():
         raise HTTPException(410, '导出文件已不可用，请重新运行')
-    return FileResponse(path, media_type='text/csv', filename=f'{SPEC["short_name"]}-{item.id}.csv')
+    suffix = f'-v{target.revision_no}' if target.revision_no else ''
+    return FileResponse(path, media_type='text/csv',
+                        filename=f'{SPEC["short_name"]}-{item.id}{suffix}.csv')
 
 
 @router.post('/{run_id}/review')
 def review(run_id: int, body: ReviewRequest, db: Session = Depends(connection),
            actor: User = Depends(allow(Role.ADMIN))):
     item = require_job(db, run_id, lock=True)
+    if item.parent_run_id is not None:
+        raise HTTPException(409, '更正重算版本随原始运行保留复核结论，不能单独复核。')
     if item.status != Status.COMPLETE or item.review != Review.PENDING:
         raise HTTPException(409, '只有已完成且待复核的记录可以提交决定')
     if body.review == Review.PENDING:

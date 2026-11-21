@@ -46,7 +46,7 @@ SPEC = {
     "decision": "验收决定",
     "action": "提交验收决定",
     "modes": ["放行试运行", "调整阈值后复测", "补齐标注后复测"],
-    "pages": ["值班总览", "来信明细", "分流验收", "分流结果", "验收复核", "分流交付"],
+    "pages": ["值班总览", "来信明细", "分流验收", "分流结果", "验收复核", "归口更正", "分流交付"],
     "fields": [
         {"key": "ticket_id", "label": "来信编号", "type": "string", "required": True, "max_length": 80},
         {"key": "text", "label": "去标识来信", "type": "string", "required": True, "max_length": 1200},

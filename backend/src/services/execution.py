@@ -5,7 +5,7 @@ from src.config.database import Session
 from src.constants.enums import Status
 from src.domain.analysis import analyze
 from src.domain.spec import SPEC
-from src.models.jobs import Delivery, Run, Schedule
+from src.models.jobs import CorrectionBatch, Delivery, Run, Schedule
 from src.models.source import Dataset
 from src.services.audit import record
 from src.utils.exports import write_report
@@ -58,14 +58,16 @@ def claim():
         job.attempt += 1
         job.lease_until = stamp + timedelta(minutes=3)
         records = db.get(Dataset, job.dataset_id).rows
-        return job.id, job.attempt, records, job.params
+        params = dict(job.params)
+        overrides = params.pop('_label_overrides', None)
+        return job.id, job.attempt, records, params, overrides, job.parent_run_id, job.revision_no
 
 
 def execute(lease):
-    job_id, attempt, rows, params = lease
+    job_id, attempt, rows, params, overrides, parent_run_id, revision_no = lease
     result = export = failure = None
     try:
-        result = analyze(rows, params)
+        result = analyze(rows, params, overrides=overrides)
         export = write_report(job_id, attempt, result)
     except ValueError as error:
         failure = str(error)[:500]
@@ -82,11 +84,46 @@ def execute(lease):
         job.result = None if failure else result
         job.export_file = export
         job.error = failure
-        record(db, 'worker', f'analysis.{job.status}', job.id, attempt=attempt, reason=failure)
-        if job.schedule_id:
-            plan = db.get(Schedule, job.schedule_id)
-            ready = not failure and result.get('ready', True)
-            detail = '已保存 CSV 到站内收件箱' if ready else (failure or result['headline'])
-            receipt = Delivery(run_id=job.id, recipient=plan.recipient, state='delivered' if ready else 'blocked', detail=detail[:500])
-            db.add(receipt)
-            record(db, 'worker', f'delivery.{receipt.state}', job.id, recipient=plan.recipient)
+        event = f'analysis.{job.status}'
+        if parent_run_id is None:
+            record(db, 'worker', event, job.id, attempt=attempt, reason=failure)
+        else:
+            record(db, 'worker', f'correction.{job.status}', job.id,
+                   parent_run_id=parent_run_id, revision_no=revision_no, reason=failure)
+        if failure or parent_run_id is None:
+            if job.schedule_id:
+                plan = db.get(Schedule, job.schedule_id)
+                ready = not failure and result.get('ready', True)
+                detail = '已保存 CSV 到站内收件箱' if ready else (failure or result['headline'])
+                receipt = Delivery(run_id=job.id, recipient=plan.recipient,
+                                   state='delivered' if ready else 'blocked', detail=detail[:500])
+                db.add(receipt)
+                record(db, 'worker', f'delivery.{receipt.state}', job.id, recipient=plan.recipient)
+            return
+        # 更正重算成功：在同一事务内切换版本指针并回写更正批次，保证页面与下载同时换版。
+        root = db.get(Run, parent_run_id, with_for_update=True)
+        if root is None or root.parent_run_id is not None:
+            job.status = Status.FAILED
+            job.error = '原始运行已不存在或链路口径有误，版本未切换，旧版结果继续有效。'
+            record(db, 'worker', 'correction.switch_aborted', job.id, parent_run_id=parent_run_id)
+            return
+        # 重跑不重复计分：仅当本任务仍是该原始运行最新一次更正重算时才切换。
+        newest = db.scalar(select(CorrectionBatch.revision_no)
+                           .where(CorrectionBatch.run_id == root.id)
+                           .order_by(CorrectionBatch.revision_no.desc()).limit(1))
+        if newest != revision_no:
+            job.status = Status.FAILED
+            job.error = f'已有更新的更正（第 {newest} 版），本次重算不切换版本、不重复计分。'
+            record(db, 'worker', 'correction.superseded', job.id,
+                   parent_run_id=root.id, latest_revision_no=newest)
+            return
+        root.current_run_id = job.id
+        job.current_run_id = job.id
+        db.flush()
+        for batch in db.scalars(select(CorrectionBatch).where(
+                CorrectionBatch.run_id == root.id,
+                CorrectionBatch.revision_no == revision_no)):
+            batch.recalc_run_id = job.id
+        record(db, 'worker', 'correction.switched', root.id,
+               run_id=job.id, revision_no=revision_no,
+               affected=(result.get('correction') or {}).get('affected', []))

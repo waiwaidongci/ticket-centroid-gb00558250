@@ -24,6 +24,18 @@ class ReviewRequest(Request):
     note: str = Field(min_length=1, max_length=500)
     decision: str = Field(default='', max_length=120)
 
+class CorrectionEntry(Request):
+    ticket_id: str = Field(min_length=1, max_length=80)
+    label: str = Field(min_length=1, max_length=120)
+
+class CorrectionRequest(Request):
+    review_no: str = Field(min_length=1, max_length=80)
+    entries: list[CorrectionEntry] = Field(min_length=1, max_length=500)
+    note: str = Field(default='', max_length=500)
+
+class WithdrawalRequest(Request):
+    note: str = Field(default='', max_length=500)
+
 class ScheduleRequest(RunRequest):
     recipient: str = Field(min_length=1, max_length=100)
     first_at: datetime

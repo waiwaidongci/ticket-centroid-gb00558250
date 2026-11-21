@@ -178,9 +178,29 @@ def _queue_summary(labels, counts, centroids, predictions, majority):
     return rows, fsum(model_scores) / len(labels), fsum(baseline_scores) / len(labels)
 
 
-def analyze(rows, normalized_params):
+def _apply_overrides(tickets, overrides):
+    """返回应用归口更正后的副本。仅允许覆盖留出件的人工归口，训练件与文本保持冻结。"""
+    if not overrides:
+        return tickets, []
+    holdout_ids = {ticket["ticket_id"] for ticket in tickets if ticket["split"] == "test"}
+    missing = sorted(set(overrides) - holdout_ids)
+    if missing:
+        raise ValueError(f"来信编号「{missing[0]}」不属于该运行的留出批，不能更正归口。")
+    adjusted, affected = [], []
+    for ticket in tickets:
+        updated = dict(ticket)
+        new_label = overrides.get(ticket["ticket_id"])
+        if new_label is not None and new_label != ticket["label"]:
+            updated["label"] = new_label
+            affected.append(ticket["ticket_id"])
+        adjusted.append(updated)
+    return adjusted, sorted(affected)
+
+
+def analyze(rows, normalized_params, overrides=None):
     tickets = sorted(validate_rows(rows), key=lambda ticket: ticket["ticket_id"])
     params = _parameters(normalized_params)
+    tickets, affected = _apply_overrides(tickets, overrides or {})
     training = [ticket for ticket in tickets if ticket["split"] == "train"]
     holdout = [ticket for ticket in tickets if ticket["split"] == "test"]
     if not training or not holdout:
@@ -202,7 +222,7 @@ def analyze(rows, normalized_params):
     total = len(holdout)
     coverage = (total - manual) / total
     delta = macro_f1 - baseline_f1
-    return {
+    result = {
         "state": "warning" if manual or wrong or delta <= 0 else "ok",
         "headline": f"留出 {total} 封，自动分流 {total - manual} 封（错投 {wrong} 封），人工分诊 {manual} 封。",
         "note": f"训练 {len(training)} 封，使用 {len(idf)} 个训练词，最低相似度 {threshold:g}。多数类基线全部投向{majority}。",
@@ -229,3 +249,11 @@ def analyze(rows, normalized_params):
             ),
         }],
     }
+    if overrides:
+        result["correction"] = {
+            "affected": affected,
+            "override_count": len(overrides),
+            "summary": (f"按归口更正重算：覆盖 {len(overrides)} 封留出件，"
+                        f"其中 {len(affected)} 封归口发生变化，训练词表、质心和多数类基线均沿用原运行。"),
+        }
+    return result
